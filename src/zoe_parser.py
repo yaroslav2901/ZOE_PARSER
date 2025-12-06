@@ -23,7 +23,7 @@ os.makedirs("out", exist_ok=True)
 
 def log(message: str):
     timestamp = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-    line = f"{timestamp} [zoe_parser] {message}"
+    line = f"{timestamp} [zaporizhzhia_parser] {message}"
     print(line)
     with open(FULL_LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
@@ -51,15 +51,9 @@ async def fetch_text() -> str:
         page = await context.new_page()
         
         try:
-            # Спочатку завантажуємо сторінку
             await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-            
-            # Чекаємо на основний контент
             await page.wait_for_selector("article", timeout=30000)
-            
-            # Отримуємо текст
             text = await page.inner_text("body")
-            
         finally:
             await browser.close()
             
@@ -67,6 +61,10 @@ async def fetch_text() -> str:
 
 
 def put_interval(result: dict, group_id: str, t1: float, t2: float) -> None:
+    # Зсув на +1 годину
+    t1 += 1.0
+    t2 += 1.0
+    
     for hour in range(1, 25):
         h_start = float(hour)
         h_mid = h_start + 0.5
@@ -78,7 +76,7 @@ def put_interval(result: dict, group_id: str, t1: float, t2: float) -> None:
         if not first_off and not second_off:
             continue
 
-        key = str(hour + 1)
+        key = str(hour)
 
         if first_off and second_off:
             result[group_id][key] = "no"
@@ -88,21 +86,53 @@ def put_interval(result: dict, group_id: str, t1: float, t2: float) -> None:
             result[group_id][key] = "second"
 
 
-def parse_date_from_header(text: str) -> str:
-    """Витягує дату з заголовків типу '06 ГРУДНЯ ПО ЗАПОРІЗЬКІЙ ОБЛАСТІ'"""
-    months = {
-        'СІЧНЯ': '01', 'ЛЮТОГО': '02', 'БЕРЕЗНЯ': '03', 'КВІТНЯ': '04',
-        'ТРАВНЯ': '05', 'ЧЕРВНЯ': '06', 'ЛИПНЯ': '07', 'СЕРПНЯ': '08',
-        'ВЕРЕСНЯ': '09', 'ЖОВТНЯ': '10', 'ЛИСТОПАДА': '11', 'ГРУДНЯ': '12'
-    }
+def parse_schedule_block(text: str, date_str: str) -> dict:
+    """Парсить блок з графіком відключень"""
+    result = {}
     
-    match = re.search(r'(\d{1,2})\s+(' + '|'.join(months.keys()) + r')', text)
-    if match:
-        day = match.group(1).zfill(2)
-        month = months[match.group(2)]
-        year = datetime.now(TZ).year
-        return f"{day}.{month}.{year}"
-    return None
+    # Шукаємо текст між заголовком і списком графіків
+    # Графіки починаються з "Години відсутності електропостачання"
+    schedule_start = re.search(r'Години\s+відсутності\s+електропостачання', text, re.IGNORECASE)
+    if schedule_start:
+        text = text[schedule_start.end():]
+        log(f"📍 Знайдено початок графіків для {date_str}")
+    
+    lines = text.split('\n')
+    for line in lines:
+        line = line.strip()
+        
+        # Шукаємо формат "1.1: 05:30 – 10:30"
+        match = re.match(r'(\d)\.(\d)\s*:\s*(.+)', line)
+        if not match:
+            continue
+            
+        group_num = f"{match.group(1)}.{match.group(2)}"
+        group_id = "GPV" + group_num
+        text_content = match.group(3)
+        
+        # Перевіряємо чи не вимикається
+        if 'не вимикається' in text_content.lower() or 'не вимикаються' in text_content.lower():
+            log(f"⚪ {group_id} — не вимикається")
+            continue
+        
+        if group_id not in result:
+            result[group_id] = {str(h): "yes" for h in range(1, 25)}
+
+        # Шукаємо інтервали відключень
+        intervals = re.findall(r'(\d{1,2}:\d{2})\s*[–\-—]\s*(\d{1,2}:\d{2})', text_content)
+        
+        for t1_str, t2_str in intervals:
+            try:
+                t1 = time_to_hour(t1_str)
+                t2 = time_to_hour(t2_str)
+                put_interval(result, group_id, t1, t2)
+            except:
+                continue
+        
+        if intervals:
+            log(f"✔️ {group_id} — {intervals}")
+    
+    return result
 
 
 async def main():
@@ -113,123 +143,101 @@ async def main():
     today = datetime.now(TZ).date()
     tomorrow = today + timedelta(days=1)
     today_str = today.strftime("%d.%m.%Y")
-    tomorrow_str = tomorrow.strftime("%d.%m.%Y")     
+    tomorrow_str = tomorrow.strftime("%d.%m.%Y")
 
     results_for_all_dates = {}
     updates_for_dates = {}
+    processed_dates = set()  # Щоб не обробляти одну дату двічі
 
-    # Розбиваємо текст на блоки по датах (шукаємо заголовки з датами)
-    date_pattern = r'(\d{1,2})\s+(СІЧНЯ|ЛЮТОГО|БЕРЕЗНЯ|КВІТНЯ|ТРАВНЯ|ЧЕРВНЯ|ЛИПНЯ|СЕРПНЯ|ВЕРЕСНЯ|ЖОВТНЯ|ЛИСТОПАДА|ГРУДНЯ)\s+ПО\s+ЗАПОРІЗЬКІЙ\s+ОБЛАСТІ'
+    months = {
+        'СІЧНЯ': '01', 'ЛЮТОГО': '02', 'БЕРЕЗНЯ': '03', 'КВІТНЯ': '04',
+        'ТРАВНЯ': '05', 'ЧЕРВНЯ': '06', 'ЛИПНЯ': '07', 'СЕРПНЯ': '08',
+        'ВЕРЕСНЯ': '09', 'ЖОВТНЯ': '10', 'ЛИСТОПАДА': '11', 'ГРУДНЯ': '12'
+    }
     
-    # Знаходимо всі блоки з датами
-    blocks = re.split(date_pattern, html_text, flags=re.IGNORECASE)
+    # Створюємо комбінований патерн для обох типів заголовків
+    # Тип 1: "ОНОВЛЕНО ГПВ НА 06 ГРУДНЯ (оновлено о 14:03)"
+    # Тип 2: "06 ГРУДНЯ ПО ЗАПОРІЗЬКІЙ ОБЛАСТІ ДІЯТИМУТЬ ГПВ"
     
-    # Обробляємо кожен блок
-    for i in range(1, len(blocks), 3):
-        if i + 2 >= len(blocks):
-            break
-            
-        day = blocks[i]
-        month = blocks[i + 1]
-        chunk = blocks[i + 2]
+    combined_pattern = (
+        r'(?:'
+        r'ОНОВЛЕНО\s+ГПВ\s+НА\s+(\d{1,2})\s+(' + '|'.join(months.keys()) + r')[^\n]*?оновлено\s+о?\s*(\d{1,2})[:\-](\d{2})'
+        r'|'
+        r'(\d{1,2})\s+(' + '|'.join(months.keys()) + r')\s+ПО\s+ЗАПОРІЗЬКІЙ\s+ОБЛАСТІ\s+ДІЯТИМУТЬ\s+ГПВ'
+        r')'
+    )
+    
+    for match in re.finditer(combined_pattern, html_text, re.IGNORECASE):
+        # Визначаємо який тип заголовка знайдено
+        if match.group(1):  # Тип 1: ОНОВЛЕНО ГПВ
+            day = match.group(1).zfill(2)
+            month = months.get(match.group(2).upper())
+            update_hour = match.group(3).zfill(2) if match.group(3) else None
+            update_minute = match.group(4) if match.group(4) else None
+            header_type = "ОНОВЛЕНО"
+        else:  # Тип 2: ПО ЗАПОРІЗЬКІЙ ОБЛАСТІ
+            day = match.group(5).zfill(2)
+            month = months.get(match.group(6).upper())
+            update_hour = None
+            update_minute = None
+            header_type = "ДІЯТИМУТЬ"
         
-        # Перетворюємо місяць на номер
-        months = {
-            'СІЧНЯ': '01', 'ЛЮТОГО': '02', 'БЕРЕЗНЯ': '03', 'КВІТНЯ': '04',
-            'ТРАВНЯ': '05', 'ЧЕРВНЯ': '06', 'ЛИПНЯ': '07', 'СЕРПНЯ': '08',
-            'ВЕРЕСНЯ': '09', 'ЖОВТНЯ': '10', 'ЛИСТОПАДА': '11', 'ГРУДНЯ': '12'
-        }
-        
-        month_num = months.get(month.upper())
-        if not month_num:
+        if not month:
             continue
-            
-        date_str = f"{day.zfill(2)}.{month_num}.{datetime.now(TZ).year}"
         
+        date_str = f"{day}.{month}.{datetime.now(TZ).year}"
+        
+        # Пропускаємо якщо не today/tomorrow
         if date_str not in (today_str, tomorrow_str):
-            #log(f"⏭️ Пропускаю {date_str} — не today/tomorrow")            
+            #log(f"⏭️ Пропускаю {date_str} ({header_type}) — не today/tomorrow")
             continue
-
-        log(f"➡️ Обробляю дату: {date_str}")
-
-        # Шукаємо оновлення в цьому блоці з датою
-        # Формат: "ОНОВЛЕНО ГПВ НА 05 ГРУДНЯ (оновлено о 18:31)"
-        update_pattern = r'ОНОВЛЕНО\s+ГПВ\s+НА\s+(\d{1,2})\s+(' + '|'.join(months.keys()) + r').*?оновлено\s+о?\s*(\d{1,2})[:\-](\d{2})'
-        update_match = re.search(update_pattern, chunk, re.IGNORECASE | re.DOTALL)
         
-        if update_match:
-            update_day = update_match.group(1).zfill(2)
-            update_month = months.get(update_match.group(2).upper())
-            update_time = f"{update_match.group(3).zfill(2)}:{update_match.group(4)}"
-            
-            if update_month:
-                update_date_str = f"{update_day}.{update_month}.{datetime.now(TZ).year}"
-                
-                # Якщо дата оновлення в межах today/tomorrow - використовуємо її
-                if update_date_str in (today_str, tomorrow_str):
-                    if update_date_str not in updates_for_dates:
-                        updates_for_dates[update_date_str] = f"{update_time} {update_date_str}"
-                        log(f"🕒 Update для {update_date_str}: {update_time}")
-                    else:
-                        # Порівнюємо часи і беремо новіший
-                        existing_time = updates_for_dates[update_date_str].split()[0]
-                        if update_time > existing_time:
-                            updates_for_dates[update_date_str] = f"{update_time} {update_date_str}"
-                            log(f"🕒 Update для {update_date_str}: {update_time} (оновлено)")
+        # Пропускаємо якщо вже оброблено
+        if date_str in processed_dates:
+            log(f"ℹ️ {date_str} ({header_type}) — вже оброблено")
+            continue
+        
+        log(f"📅 {header_type}: Обробляю {date_str}")
+        
+        # Зберігаємо час оновлення
+        if update_hour and update_minute:
+            update_time = f"{update_hour}:{update_minute}"
+            updates_for_dates[date_str] = f"{update_time} {date_str}"
+            log(f"🕒 Update з тексту: {update_time}")
         else:
-            # Якщо не знайдено оновлення, встановлюємо поточний час і поточну дату
-            if date_str not in updates_for_dates:
-                current_datetime = datetime.now(TZ)
-                current_time = current_datetime.strftime("%H:%M")
-                current_date = current_datetime.strftime("%d.%m.%Y")
-                updates_for_dates[date_str] = f"{current_time} {current_date}"
-                log(f"🕒 Update для {date_str}: {current_time} {current_date} (поточний час і дата, без оновлення)")
+            current_time = datetime.now(TZ).strftime("%H:%M")
+            updates_for_dates[date_str] = f"{current_time} {date_str}"
+            log(f"🕒 Update поточний час: {current_time}")
+        
+        # Витягуємо блок до наступного заголовка
+        match_end = match.end()
+        
+        # Шукаємо наступний заголовок будь-якого типу
+        next_match = re.search(combined_pattern, html_text[match_end:], re.IGNORECASE)
+        
+        if next_match:
+            schedule_block = html_text[match.start():match_end + next_match.start()]
+        else:
+            # Якщо наступного заголовка немає, беремо до кінця або обмежуємо
+            schedule_block = html_text[match.start():match.start() + 5000]
+        
+        log(f"📦 Розмір блоку: {len(schedule_block)} символів")
+        
+        # Парсимо графік
+        result = parse_schedule_block(schedule_block, date_str)
+        
+        if not result:
+            log(f"⚠️ Не знайдено графіків для {date_str}")
+            continue
         
         # Створюємо timestamp
         day_int, month_int, year_int = map(int, date_str.split("."))
         date_dt = datetime(year_int, month_int, day_int, tzinfo=TZ)
         date_ts = int(date_dt.timestamp())
-
-        result = {}
-
-        # Шукаємо графіки у форматі "1.1: 05:30 – 10:30" або "1.1: не вимикається"
-        lines = chunk.split('\n')
-        for line in lines:
-            line = line.strip()
-            
-            # Шукаємо формат "1.1: 05:30 – 10:30"
-            match = re.match(r'(\d)\.(\d)\s*:\s*(.+)', line)
-            if not match:
-                continue
-                
-            group_num = f"{match.group(1)}.{match.group(2)}"
-            group_id = "GPV" + group_num
-            text = match.group(3)
-            
-            # Перевіряємо чи не вимикається
-            if 'не вимикається' in text.lower() or 'не вимикаються' in text.lower():
-                continue
-            
-            if group_id not in result:
-                result[group_id] = {str(h): "yes" for h in range(1, 25)}
-
-            # Шукаємо інтервали відключень
-            # Формат: 05:30 – 10:30 або 05:30-10:30 або 05:30 - 10:30
-            intervals = re.findall(r'(\d{1,2}:\d{2})\s*[–\-—]\s*(\d{1,2}:\d{2})', text)
-            
-            for t1_str, t2_str in intervals:
-                try:
-                    t1 = time_to_hour(t1_str)
-                    t2 = time_to_hour(t2_str)
-                    put_interval(result, group_id, t1, t2)
-                except:
-                    continue
-            
-            if intervals:
-                log(f"✔️ {group_id} — знайдено {len(intervals)} інтервалів")
-
-        if result:
-            results_for_all_dates[str(date_ts)] = result
+        
+        results_for_all_dates[str(date_ts)] = result
+        processed_dates.add(date_str)
+        log(f"✅ Додано графік для {date_str}: {len(result)} груп")
 
     if not results_for_all_dates:
         log("⚠️ Не знайдено жодних графіків відключень!")
