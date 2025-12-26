@@ -86,23 +86,16 @@ def put_interval(result: dict, group_id: str, t1: float, t2: float) -> None:
             result[group_id][key] = "second"
 
 
-def parse_schedule_block(text: str, date_str: str, date_header_patterns: list) -> dict:
+def parse_schedule_block(text: str, date_str: str) -> dict:
     """Парсить блок з графіком відключень"""
     result = {}
     
     # Шукаємо текст між заголовком і списком графіків
+    # Графіки починаються з "Години відсутності електропостачання"
     schedule_start = re.search(r'Години\s+відсутності\s+електропостачання', text, re.IGNORECASE)
     if schedule_start:
         text = text[schedule_start.end():]
         log(f"📍 Знайдено початок графіків для {date_str}")
-    
-    # КРИТИЧНО: Обрізаємо текст до наступного заголовка дати всередині блоку
-    for pattern in date_header_patterns:
-        next_date_match = re.search(pattern, text, re.IGNORECASE)
-        if next_date_match:
-            text = text[:next_date_match.start()]
-            log(f"✂️ Обрізано текст до наступного заголовка на позиції {next_date_match.start()}")
-            break
     
     lines = text.split('\n')
     for line in lines:
@@ -154,7 +147,7 @@ async def main():
 
     results_for_all_dates = {}
     updates_for_dates = {}
-    processed_dates = set()
+    processed_dates = set()  # Щоб не обробляти одну дату двічі
 
     months = {
         'СІЧНЯ': '01', 'ЛЮТОГО': '02', 'БЕРЕЗНЯ': '03', 'КВІТНЯ': '04',
@@ -162,26 +155,17 @@ async def main():
         'ВЕРЕСНЯ': '09', 'ЖОВТНЯ': '10', 'ЛИСТОПАДА': '11', 'ГРУДНЯ': '12'
     }
     
-    # Комбінований патерн для ВСІХ типів заголовків
+    # Створюємо комбінований патерн для обох типів заголовків
+    # Тип 1: "ОНОВЛЕНО ГПВ НА 06 ГРУДНЯ (оновлено о 14:03)"
+    # Тип 2: "06 ГРУДНЯ ПО ЗАПОРІЗЬКІЙ ОБЛАСТІ ДІЯТИМУТЬ ГПВ"
+    
     combined_pattern = (
         r'(?:'
-        # Тип 1: ОНОВЛЕНО ГПВ НА 06 ГРУДНЯ (оновлено о 14:03)
         r'ОНОВЛЕНО\s+ГПВ\s+НА\s+(\d{1,2})\s+(' + '|'.join(months.keys()) + r')[^\n]*?оновлено\s+о?\s*(\d{1,2})[:\-](\d{2})'
         r'|'
-        # Тип 2: 06 ГРУДНЯ ПО ЗАПОРІЗЬКІЙ ОБЛАСТІ ДІЯТИМУТЬ ГПВ
         r'(\d{1,2})\s+(' + '|'.join(months.keys()) + r')\s+ПО\s+ЗАПОРІЗЬКІЙ\s+ОБЛАСТІ\s+ДІЯТИМУТЬ\s+ГПВ'
-        r'|'
-        # Тип 3: СКОРЕГОВАНИЙ ГПВ НА 17 ГРУДНЯ
-        r'СКОРЕГОВАНИЙ\s+ГПВ\s+НА\s+(\d{1,2})\s+(' + '|'.join(months.keys()) + r')'
         r')'
     )
-    
-    # Список патернів для виявлення вкладених заголовків всередині блоків
-    date_header_patterns = [
-        r'ОНОВЛЕНО\s+ГПВ\s+НА\s+\d{1,2}\s+(?:' + '|'.join(months.keys()) + r')',
-        r'\d{1,2}\s+(?:' + '|'.join(months.keys()) + r')\s+ПО\s+ЗАПОРІЗЬКІЙ\s+ОБЛАСТІ\s+ДІЯТИМУТЬ\s+ГПВ',
-        r'СКОРЕГОВАНИЙ\s+ГПВ\s+НА\s+\d{1,2}\s+(?:' + '|'.join(months.keys()) + r')'
-    ]
     
     for match in re.finditer(combined_pattern, html_text, re.IGNORECASE):
         # Визначаємо який тип заголовка знайдено
@@ -191,18 +175,12 @@ async def main():
             update_hour = match.group(3).zfill(2) if match.group(3) else None
             update_minute = match.group(4) if match.group(4) else None
             header_type = "ОНОВЛЕНО"
-        elif match.group(5):  # Тип 2: ПО ЗАПОРІЗЬКІЙ ОБЛАСТІ
+        else:  # Тип 2: ПО ЗАПОРІЗЬКІЙ ОБЛАСТІ
             day = match.group(5).zfill(2)
             month = months.get(match.group(6).upper())
             update_hour = None
             update_minute = None
             header_type = "ДІЯТИМУТЬ"
-        else:  # Тип 3: СКОРЕГОВАНИЙ ГПВ
-            day = match.group(7).zfill(2)
-            month = months.get(match.group(8).upper())
-            update_hour = None
-            update_minute = None
-            header_type = "СКОРЕГОВАНИЙ"
         
         if not month:
             continue
@@ -211,11 +189,12 @@ async def main():
         
         # Пропускаємо якщо не today/tomorrow
         if date_str not in (today_str, tomorrow_str):
+            #log(f"⏭️ Пропускаю {date_str} ({header_type}) — не today/tomorrow")
             continue
         
         # Пропускаємо якщо вже оброблено
         if date_str in processed_dates:
-            log(f"ℹ️ {date_str} ({header_type}) — вже оброблено, пропускаю")
+            log(f"ℹ️ {date_str} ({header_type}) — вже оброблено")
             continue
         
         log(f"📅 {header_type}: Обробляю {date_str}")
@@ -227,8 +206,10 @@ async def main():
             log(f"🕒 Update з тексту: {update_time}")
         else:
             current_time = datetime.now(TZ).strftime("%H:%M")
+            #updates_for_dates[date_str] = f"{current_time} {date_str}"
             updates_for_dates[date_str] = f"{current_time} {today_str}"
-            log(f"⚠️ Не знайдено час оновлення для {date_str}, використано поточний: {current_time}")
+            #log(f"🕒 Update поточний час: {current_time}")
+            log(f"⚠️ Не знайдено час оновлення в тексті для {date_str}, використано поточу  дату та час {today_str} {current_time}")
         
         # Витягуємо блок до наступного заголовка
         match_end = match.end()
@@ -239,12 +220,13 @@ async def main():
         if next_match:
             schedule_block = html_text[match.start():match_end + next_match.start()]
         else:
+            # Якщо наступного заголовка немає, беремо до кінця або обмежуємо
             schedule_block = html_text[match.start():match.start() + 5000]
         
         log(f"📦 Розмір блоку: {len(schedule_block)} символів")
         
-        # Парсимо графік (передаємо список патернів для виявлення вкладених дат)
-        result = parse_schedule_block(schedule_block, date_str, date_header_patterns)
+        # Парсимо графік
+        result = parse_schedule_block(schedule_block, date_str)
         
         if not result:
             log(f"⚠️ Не знайдено графіків для {date_str}")
@@ -291,6 +273,9 @@ async def main():
     # Формуємо JSON
     new_json = {
         "regionId": "Zaporizhzhia",
+        #"lastUpdated": datetime.now(TZ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        #"lastUpdated":int(datetime.now(TZ).timestamp()),   
+        #"lastUpdatedInfo": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"), 
         "lastUpdated": datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
         "fact": {
             "data": results_for_all_dates,

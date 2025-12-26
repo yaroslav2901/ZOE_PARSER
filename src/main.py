@@ -25,8 +25,8 @@ def log(message):
 
 
 def main():
-    # Чистимо  лог від даних старше 5 днів
-    removed = clean_log(FULL_LOG_FILE, days=5)
+    # Чистимо  лог від даних старше 3 днів
+    removed = clean_log(FULL_LOG_FILE, days=3)
     if removed is not None:
         if removed > 0:
             log(f"🧹 Логи очищено — видалено {removed} старих рядків")
