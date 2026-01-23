@@ -2,37 +2,35 @@ from datetime import datetime, timedelta
 import os
 from typing import List
 
-def clean_log(log_file_path: str, days: int = 7):
-    """
-    Очищає лог-файл, видаляючи записи старше `days` днів.
-    Рядки мають формат:
-    YYYY-MM-DD HH:MM:SS ...
-    """
+from datetime import datetime, timedelta
 
+def clean_log(log_file_path: str, days: int = 7):
     cutoff_time = datetime.now() - timedelta(days=days)
     kept_lines = []
     removed_count = 0
 
+    keep_block = False  # ❗ починаємо НЕ зберігати, поки не знайдемо timestamp
+
     try:
-        with open(log_file_path, "r", encoding="utf-8") as f:
+        with open(log_file_path, "r", encoding="utf-8-sig") as f:
             for line in f:
-                if not line.strip():
-                    kept_lines.append(line)
+
+                is_timestamp = False
+
+                if len(line) >= 19:
+                    try:
+                        ts = datetime.strptime(line[:19], "%Y-%m-%d %H:%M:%S")
+                        is_timestamp = True
+                        keep_block = ts >= cutoff_time
+                    except ValueError:
+                        pass
+
+                # ❌ до першого timestamp — усе відкидаємо
+                if not is_timestamp and not kept_lines:
+                    removed_count += 1
                     continue
 
-                if len(line) < 19:
-                    kept_lines.append(line)
-                    continue
-
-                timestamp_str = line[:19]
-
-                try:
-                    timestamp = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    kept_lines.append(line)
-                    continue
-
-                if timestamp >= cutoff_time:
+                if keep_block:
                     kept_lines.append(line)
                 else:
                     removed_count += 1
